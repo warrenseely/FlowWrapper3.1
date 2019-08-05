@@ -1,0 +1,438 @@
+  /*UPDATE April 25, 2019: 
+   * Added secondary layer of control for jaws to help alignment. This is based on comparing time snapshots from the jaws and register mark to verify encoder position of jaws, similar to the secondary layer utilized for the feeder chain in V3.1 
+   * Also cleared encoder counters when stop button is pressed to help prevent surging upon startup after a jammed feeder chain
+   * 
+   * Implemented April 8, 2019. 
+   * V3.1 introduces encoder control of jaws. This is coupled with a second jaw to enable continuous running.
+   * Also includes a 400ms debounce for the register sensor, jaw position sensor and the feeder finger sensor
+   * NOTE that this limits max speed to around 150 pkg/min
+   * Also firms out the second layer of control using time snapshots to verify the encoder position of jaws and feeder chain relative to the paper register mark.
+   *        This works by computing the time difference between when the register mark and the feeder finger/jaw home sensor are seen.
+   *        The encoder values for jaws and feeder are then manipulated to convince the PID loops to adjust as necessary.
+   * NOTE pin assignment changes from version 3.0: 
+   *        PaperEncoder_PIN 19 --> 0
+   *        FeederFinger_PIN 8 --> 19
+   *  
+   *  
+   *  V3.0 introduces control by an Arduino Mega rather than a Nano for more pins and controls
+   * Also introduces display screen controlled by and Arduino Nano for better data viewing
+   * NOTE THAT PINS 20 && 21 ARE RESERVED FOR DISPLAY SCREEN i2C!
+   * NOTE also that PJ0 and PJ1 do not actually support PCINT despite what the manual says
+   * NOTE that jawPWM and feederPWM(pins 11 and 12) are 10 bit control, so 0-1023 INVERTED
+   *           paperPWM(pin 13) is 8 bit control, so 0-255 INVERTED
+   *     *****The reason these are inverted PWM is due to the way the control circuit is designed; Thus, 10v to vfd(full speed) is 0 PWM and 0v to vfd is 255/1023 PWM******
+   * NOTE no interrupts on pin 3 for some reason
+   * 
+   * TO DO: convert speed input to pkg/min(estimated) to aid setting
+   *        maybe dynamic(on the fly) speed changes
+   *        communication upgrades(non blocking when waiting for ack)
+   *        
+   * 
+   * V2.2 fixed the feeder chain surging issues is previous versions.
+   * Also works in tandem with another arduino to perform no gap no crimp to avoid crushing mints.
+   * 
+   * V2.1 gives priming of the feeder chain on startup with mints prior to running
+   * Also introduces LCD display communication on the tx channel of USB
+   * Works simultaneously with the USB plugged in, although LCD commands show as garbage
+   * Note that overloaded function writeLCD() can only print those types of data it is overloaded for
+   * Also introduces a 1.5 minute startup delay on power up to allow the VFDs to unscramble their brains
+   * Also introduces checks to ensure jaws make complete cycle during startup to avoid weird pwm bugs resulting from less than full cycle
+   * Also disables pin change interrupts when stop button pressed, reenables when start button pressed UNTESTED
+   * Also introduces a timing comparison between the paper register and feeder fingers to adjust for accumulated encoder error
+   *
+   * V2.0 introduced PID control of the feeder chain to match the paper speed. 
+  Also introduced Timer1 set as 16bit to enable 10bit pwm on pins 9 and 10(jaw and feeder pwm) for greater resolution(1024 steps vs 255)
+  Also utilizes encoders on paper drive and feeder drive to match speeds correctly utilizing the PID control.
+  This version introduces a timed-loop control for consistent response time for both button commands and run operation.
+  includes live printout of speed errors, and current PID scalars along with ability to adjust during run operation WITHOUT SAVING
+  Also splits the jaw and paper register interrupts into separate pin change ISRs.
+  Note that feeder speed is adjusted by PID, but jaw speed is hard coded in this version. 
+  Jaw speed is still stop/go control.
+  Note that the PID runs off of incrementing pulses on the encoders; 
+  Encoder counts utilize LONG int, which should give 1,491.3 hours of continouos run time(without pressing stop) prior to overrun*/
+
+//Encoder wiring:
+//Green: A-phase---not used at this time
+//White: B-phase
+//Red: +5-24v
+//Black: Ground
+
+/*Paper speed is MASTER
+  Jaws run based on paper speed
+  feeder chain runs based off paper speed*/
+
+
+/*******************IMPORTANT!!!!!********************
+*************Pkg dimensions are in METRIC*************
+*******************************************************/
+// -- > https://github.com/JChristensen/Button/blob/master/Button.cpp
+#include <Button.h> //include this library for convenient reading of the buttons
+#include <Wire.h> //communication to the display screen arduino
+
+//NOTE THAT PINS 20 && 21 ARE RESERVED FOR DISPLAY SCREEN i2C!
+#define SettingsBtn A1 //settings button
+#define StopBtn A4 //stop button
+#define StartBtn A3 //start machine
+#define InchBtn A5 //to inch the feeder/paper for aligning
+#define crimpSwitch A2 //check for ensuring air crimp switch is in correct position
+#define speedset A0 //analog input for setting speed. Wire outter pins of potentiometer to 5v, gnd. Center pin to A5
+
+#define JawEnable_PIN 6 //on/off for jaw vfd control PA4
+#define PaperEnable_PIN 5 //on/off for paper vfd control PC3
+#define FeederEnable_PIN 4 //on/off for feeder chain vfd control PL3
+
+#define JawEncoder_PIN A8 //interrupt, the jaw encoder sensor
+#define PaperEncoder_PIN 0 //interrupt, register encoder sensor
+#define FeederEncoder_PIN 53 //interrupt, feeder chain encoder sensor
+#define JawPos_PIN 18 //interrupt, input for the jaw position; HIGH = HOME, LOW = RETURN TO HOME
+#define RegisterSensor_PIN 2 //interrupt, triggers jaw to cut
+#define FeederFinger_PIN 19//8 //interrupt, to detect feeder chain fingers for homing and adjusting speed during run
+#define PattySensor_PIN 15 //63 is a sensor to detect patties upon startup only
+
+//#define ejectPkg_PIN 6 //output for triggering air eject of a bad pkg
+#define noGapNoCrimp_PIN 10 //this takes two sensor inputs OR'd to determine if there is a patty in the glue strip so we can avoid hitting it and messing everything up
+
+#define jawPWM 11 //pwm output to control the speed of the jaw drive; 0-1023 control INVERTED
+#define feederPWM 12 //pwm output to control speed of feeder drive; 0-1023 control INVERTED
+#define paperPWM 13 //pwm output to control speed of paper drive; 0-255 control INVERTED
+//20 and 21 are reserved for i2C with the display screen arduino
+
+//defines for communication to display screen
+// "\f" is clear screen command
+// "\r" is clear current line command
+// "\n" is newline command
+enum SEND_COMMANDS { CLRSCR = 1, CLREOL, GOTOXY, ESC = 27 };
+//char clearScreen [] = { ESC, CLRSCR };
+char clearToEndOfLine [] = { ESC, CLREOL };
+char gotoXY [] = { ESC, GOTOXY };  // followed by x and y
+char buf [20];
+
+//constant motor defines
+const int stopAll = 1;
+
+//button defines
+#define PULLUP true
+#define INVERT true
+#define DEBOUNCE_MS 20
+//#define DEBOUNCE_MS1 2000
+
+////ISRs
+volatile int paperHome = 0, paperhomeflag = 0, fingerHomeFlag = 0, pkgcount = 0, totalpkgcount = 0, lastpkgcount = 0;
+volatile int jawhomeflag = 0, skipCut = 0, skipcount = 0;
+volatile long int PaperCount = 0, FeederCount = 0, JawCount = 0; //counters for the encoders
+volatile long int pkgTime = 0, lastPkgTime = 0;
+
+//ISR debouncing
+volatile long lastRegisterTrigger = 0, lastJawTrigger = 0, lastFingerTrigger = 0; //stores the last time these interrupts were trigger for debouncing
+const unsigned long registerDebounce = 400, jawDebounce = 400, fingerDebounce = 400; //400 ms debounce time for the sensor interrupts
+
+int pkgPerMinute = 0;
+long feeder_count = 0, paper_count = 0, jaw_count = 0, feeder_error = 0, jaw_error = 0;
+volatile int jaw_speed = 790, feeder_speed = 770, paper_speed = 220; //initial speed settings
+int setpoint = 5, setBtnFlag = 0, inchBtnFlag = 0, startupFlag = 0, StartBtnState = 0, StopBtnState = 1, currently_running = 0, crimpStatus = 0;
+int homeflag = 0; //for startup
+int errorStop = 0; //error flag to shut down machine
+int lastsetpoint = 0;
+
+//timed loop variables
+unsigned long oldTime = 0;
+unsigned int loop_time = 100, startupDelay = 2000;
+unsigned long startTime = 0;
+
+//for PID loop
+long int feederIntegral = 0, jawIntegral = 0; 
+long lastfeeder_error = 0, lastjaw_error = 0;
+float fkp = 0.08, fki = 0.006, fkd = 0.59; //kp = 0.08, ki = 0.006, kd = 0.59 good start, .01, .0024, 0.1
+float jkp = 0.170, jki = 0.0006, jkd = 1.15;
+
+//the base scalars for matching the encoder speeds correctly; increase to speed up, decrease to slow down    
+volatile float jawcountScalar = 1.359; //1.3599
+const float feedercountScalar = 1.375; 
+
+int feederoffset = 0, jawoffset = 0; //timing offset between finger and register; timing offset between jaw and register
+volatile long int feedertimeDifference = 0, jawtimeDifference = 0;
+int badPkgCount = 0; //this counts the bad packages so we can adjust jaw_counter when we skip a cut
+
+//declare buttons
+ Button settingsBtn(SettingsBtn, PULLUP, INVERT, DEBOUNCE_MS);    //Declare settings button on A1; 
+ Button stopBtn(StopBtn, PULLUP, INVERT, DEBOUNCE_MS);    //Declare stop button on A1; 
+ Button startBtn(StartBtn, PULLUP, INVERT, DEBOUNCE_MS);    //Declare start button on A2; 
+ Button inchBtn(InchBtn, PULLUP, INVERT, DEBOUNCE_MS); //inching button
+ Button crimpSw(crimpSwitch, PULLUP, INVERT, DEBOUNCE_MS); //check for crimp release button
+ 
+void setup() 
+{
+  pinMode(PaperEncoder_PIN, INPUT_PULLUP); //interrupt counters for the encoder pulses; set to input pullup to enable pullup resistors
+  pinMode(FeederEncoder_PIN, INPUT_PULLUP); //interrupt counters for the encoder pulses; set to input pullup to enable pullup resistors
+  pinMode(JawEncoder_PIN, INPUT_PULLUP); //interrupt counter for reading the jaw encoder pulses
+  
+  pinMode(JawPos_PIN, INPUT_PULLUP);
+  pinMode(RegisterSensor_PIN, INPUT_PULLUP); 
+  pinMode(PattySensor_PIN, INPUT_PULLUP); //senses a patty upon startup for homing
+  pinMode(FeederFinger_PIN, INPUT_PULLUP); //senses the feeder finger on startup for homing
+  pinMode(speedset, INPUT); //input for analog signal to set machine speed
+  
+  pinMode(noGapNoCrimp_PIN, INPUT_PULLUP);
+  
+  pinMode(jawPWM, OUTPUT); //jaw speed
+  pinMode(paperPWM, OUTPUT); //paper speed
+  pinMode(feederPWM, OUTPUT); //feeder chain speed
+  
+  pinMode(JawEnable_PIN, OUTPUT); //jaw on/off
+  pinMode(PaperEnable_PIN, OUTPUT); //paper on/off
+  pinMode(FeederEnable_PIN, OUTPUT); //feeder chain on/off
+  
+  attachInterrupt(digitalPinToInterrupt(JawPos_PIN), jawPosISR, RISING); //triggers on rising, senses home position of jaws
+  attachInterrupt(digitalPinToInterrupt(RegisterSensor_PIN), RegisterSensorISR, FALLING); //triggers on falling, senses paper register marks
+  attachInterrupt(digitalPinToInterrupt(FeederFinger_PIN), feederFingerISR, FALLING); //triggers on falling, used for finger timing
+  //attachInterrupt(digitalPinToInterrupt(PaperEncoder_PIN), paperEncoderISR, CHANGE); //triggers on change, used for paper encoder counting
+
+    //pin change interrupt for A8, jaw encoder
+  PCMSK2 |= bit(PCINT16); //want pin A8
+  PCIFR |= bit(PCIF2); //clear any outstanding interrupts
+  PCICR |= bit(PCIE2); //enable pin change interrupts for port K
+
+  PCMSK1 |= bit(PCINT8); //want pin 0
+  PCIFR |= bit(PCIF1); //clear any outstanding interrupts
+  PCICR |= bit(PCIE1); //enable pin change interrupts on port E
+
+  //pin change interrupt for pin 53, feeder encoder
+  PCMSK0 |= bit(PCINT0); //want pin 53
+  PCIFR |= bit(PCIF0); //clear any outstanding interrupts
+  PCICR |= bit(PCIE0); //enable pin change interrupts on port B
+
+
+//set timer1 (pins 11, 12, 13)
+  TCCR1B = 0x09; //set control register to no prescaling
+              //WGM02 = 1
+  TCCR1A = 0x03; //set WGM01 and WGM00 to 1 (10 bit resolution)
+  
+  //set up communication  
+  Serial.begin(115200); //USB for troubleshooting
+  Wire.begin(); //start i2C to the display screen
+
+  analogWrite(jawPWM, 1023);
+  //analogWrite(paperPWM, 255);
+  analogWrite(feederPWM, 1023);
+  //put this turn-off here after the fireup print statement, works best for ensuring no random movement
+  //shut all vfds off now to prevent random movement during startup
+  digitalWrite(JawEnable_PIN, 0);
+  digitalWrite(PaperEnable_PIN, 0);
+  digitalWrite(FeederEnable_PIN, 0);
+
+  delay(4000); //give four seconds for the screen to boot up first
+  sendString("\f"); //clear the last line just in case
+  sendString("Hal9000 V3.1 Online\n"); //write that that machine is online
+  Serial.println("Hal 9000 V3.1 online");
+  delay(1000); //delay for one second to allow voltages to stabilize after startup
+  //getSpeedSetting(); //get the current speed setting from the potentiometer and display
+  //paper_speed = setpoint; //set the paper_speed to the current setting for the potentiometer
+}
+
+void loop() 
+{
+  //read the buttons every time we loop, outside the timed loop to give best chance of catching them
+  stopBtn.read(); //read stop button
+  startBtn.read(); //read start button
+  settingsBtn.read(); //read the status of the settings button
+  inchBtn.read(); //read status of inching button
+  crimpSw.read(); //read status of crimp roll switch
+  
+  button_results(); //deal with which buttons were read
+  
+  unsigned long currentTime = millis();
+  if((unsigned long)(currentTime - oldTime) >= loop_time) //we are on a timed loop every 100 ms
+  {
+    oldTime = millis(); //get the current time to reset timed loop
+    
+    if(StartBtnState && !StopBtnState && !startupFlag) //we have a run condition and are not starting up 
+    {            
+        cli(); //disable external interrupts to get a copy of the counter variables
+        feeder_count = FeederCount; //copy the pulse count into a non volatile variable to prevent modification during use; these are long ints, they are reset on startup
+        paper_count = PaperCount; //copy the pulse count into a non volatile variable to prevent modification during use; these are long ints, they are reset on startup
+        jaw_count = JawCount; //copy into non volatile variable; ***NOT SURE IF CLI() DISABLES INTERRUPT CAPUTRE OR NOT***
+        sei(); //re-enable external interrupts 
+
+        //we are reading paper and feeder encoder counts on CHANGE so 1200 pulses/rev; 
+        //600 pulses per feeder finger(it is driven such that each finger is 1/2 revolution of the encoder shaft). 
+        //using my trial and error scalar of 1.343, this gives there should be 600/1.343 = 446.7609829 pulses per paper pkg
+        //rounded gives 447 pulses per paper pkg; Accumulated error of ~0.239017126 pulses per pkg; should be able to deal with that using the timingScalar
+        //the accumulated error in the calculation gives roughly 4mm of error in 65 pkgs for timingScalar to deal with
+        
+        long temp = (paper_count * feedercountScalar) + 0.5; 
+        feeder_error = temp - feeder_count; //get the difference in the pulse numbers
+       
+        feederPID(); //calculate the PID to adjust feeder chain speed
+        analogWrite(feederPWM, feeder_speed); //adjust the feeder chain speed
+
+        //jaw encoder should be around 600 pulses per pkg since triggers on CHANGE and we make a cut every half revolution
+        //this means we can use our scalar of 1.4 for relating it to paper_count
+        //if we have to skip a cut due to misaligned pkg that will mess up the jaw encoder counts 
+        //-->add 600 counts(one cuts worth) to JawCount after a patty is skipped to keep it in line with the paper counter
+        temp = (paper_count * jawcountScalar) + 0.5;
+        jaw_error = temp - jaw_count; //get the difference in pulse numbers
+        
+        jawPID(); //calculate the PID to adjust jaw speed
+        analogWrite(jawPWM, jaw_speed);
+        
+       // if(skipCut == 0) //only run jaw PID if we are not skipping a bad patty
+       // {
+//          long temp1 = (paper_count * (jawcountScalar)) + 0.5;// + (jawtimingScalarcopy / paper_count))) + 0.5; //commented out this half because testing without paper
+//          jaw_error = temp1 - jaw_count + (badPkgCount * 600)); //get the difference in pulse numbers; If we skip a pkg(bad pkg) we have to still compensate for those missed encoder counts
+//  
+//          jawPID(); //calculate the PID to adjust jaw speed
+//          analogWrite(jawPWM, jaw_speed); //adjust the jaw speed
+       // }
+      //printData(7);
+      if((pkgcount > 0) && (pkgcount != lastpkgcount)) //only print pkgcount when it changes; pkgcount skips counting the first 10 on powerup. Does not skip after that.
+      {
+        lastpkgcount = pkgcount; //update
+        //This statement should trigger AFTER seeing a new pkg every time so no need to isolate it from interrupts pertaining to it's variables
+        pkgPerMinute = ((1.0 / (pkgTime - lastPkgTime)) / 0.00001667) + 0.5; //packages per minute = (1 package / (# of milliseconds passed)) / (portion of minute per millisecond)
+        
+        Display(2); //output the pkg count to the display screen
+        //printData(5);
+        //printData(7);
+      } //end first pkg count if
+    }//end runtime if statement
+    else if(StartBtnState && !StopBtnState && startupFlag) //we have a run condition and we are starting up 
+    { 
+      startupProcedure(); //homing and alignment
+    }//end startup if statement
+  }//end timed loop
+
+  //livePIDTune(); //for tuning PID and feeder drive speed(DOES NOT SAVE!)
+}//end main loop 
+
+/****************************************************************************/
+
+ISR(PCINT2_vect) //for counting jaw encoder pulses, triggers on CHANGE
+{
+  JawCount++; //increment jaw encoder counter
+} //end jaw encoder ISR
+
+ISR(PCINT1_vect) //used to detect encoder pulses. triggers on CHANGE
+{
+  PaperCount++; //increment counter
+}//end paper encoder ISR
+//void paperEncoderISR() //for counting paper encoder pulses, triggers on CHANGE
+//{
+//  PaperCount++; //increment paper encoder counter
+//}
+
+//ISR
+ISR(PCINT0_vect) //used to detect feeder chain encoder pulses. triggers on CHANGE
+{
+  FeederCount++; //increment feeder encoder counter
+}//end feeder encoder ISR
+
+
+//ISR
+void feederFingerISR() //feeder chain timing, triggers on FALLING, finger is seen when pin goes LOW
+{
+  unsigned long currentTrigger = millis(); //get current time we entered interrupt
+  if(currentTrigger - lastFingerTrigger >= fingerDebounce) //time between triggers must be greater than debounce time
+  {
+    lastFingerTrigger = currentTrigger; //update the last trigger
+    if(!fingerHomeFlag) //normal run operation
+    {
+      feedertimeDifference = (long)(millis() - (pkgTime + feederoffset)); //time difference between paper register and feeder finger, paper register is always ahead slightly so shift with offset
+                                                              //of course, offset changes with different pkg/minute speeds. So we will just do factors of 10 for paper VFD PWM and set offset when the speed is set.
+        
+      if(feedertimeDifference < -10) //finger is ahead of register mark;
+        FeederCount -= 10; //speeds up the feeder by lowering feeder encoder count; feeder PID will compensate and speed feeder up
+      else if(feedertimeDifference > 10) //finger is behind the register mark
+        FeederCount += 10; //slows the feeder by increasing feeder encoder count; feeder PID will compensate and slow feeder down
+    } //end normal run if
+    else if(startupFlag == 4)//we are homing and have seen a patty
+    {
+      fingerHomeFlag = 0; //reset to zero
+       //stop feeder chain vfd
+      digitalWrite(FeederEnable_PIN, 0);
+    } //end homing if
+  } //end debounce if
+} //end feederFingerISR
+
+//ISR
+void RegisterSensorISR() //paper register ISR, pin goes LOW when register mark seen
+{  
+  unsigned long currentTrigger = millis(); //get the current time that we entered interrupt
+  if(currentTrigger - lastRegisterTrigger >= registerDebounce) //time between triggers must be greater than debounce time
+  {
+    lastRegisterTrigger = currentTrigger; //update teh last trigger time
+  //check for the paper register mark
+   
+    if(paperHome == 0) //we are not homing
+    {
+      pkgcount++; //increment the package count
+
+      lastPkgTime = pkgTime; //preserve last time
+      pkgTime = millis(); //get time we saw this package register mark 
+
+//      if(skipCut == 2) //set in jaw position ISR, for skipping bad patty
+//      {
+//        digitalWrite(jawEnable_PIN, 1); //reenable jaws after skipping a misaligned patty
+//        JawCount += (skipcount * 600); //we skipped a package, add the missed counts to total count so we can keep up with everything else
+//        skipCut = 0; //reset
+//        skipcount = 0; //reset
+//      }  
+    }//end normal run if
+    else //for paper homing upon startup only
+    {
+      paperhomeflag += 1;
+      //we are at home position on startup so stop paper
+      if(paperhomeflag == 2)
+      {
+        digitalWrite(PaperEnable_PIN, 0); 
+        paperHome = 0; //reset to 0; set to 1 in startup routine
+      }
+    } //end homing if
+  } //end debounce if
+}//end paper register ISR
+
+//ISR
+void jawPosISR() //jaw control ISR, triggers on RISING, if pin is LOW we know we are at home
+ {                
+  unsigned long currentTrigger = millis(); //get the current time that we entered interrupt
+  if(currentTrigger - lastJawTrigger >= jawDebounce)
+  {
+    lastJawTrigger = currentTrigger;
+    if(jawhomeflag == 2) //normal run operation
+    {
+      jawtimeDifference = (long)(millis() - (pkgTime + jawoffset)); //time difference between paper register and jaws, paper register is always behind slightly so shift with offset
+                                                         //of course, offset changes with different pkg/minute speeds.
+
+//jawtimeDifference around 1160-1220 means jaws are AHEAD of register mark because it is performing the calculation off the PREVIOUS register time
+//jawtimeDifference around 0-40 means jaws are BEHIND register mark because it is performing the calculation off the CURRENT register time
+
+      if((jawtimeDifference / 100U) > 0) //we have a 4 digit number so jaws are AHEAD of register mark, slow jaws down
+      {
+        if(jawtimeDifference < 1160) //we already know jaws are ahead of register mark, if the difference is less than 1160 we need to slow jaws down
+           JawCount += 5; //slows down the jaws by artificially raising the jaw encoder count. The jaw PID will compensate and slow it down
+      }
+      else//we have a less than 4 digit number, so jaws are BEHIND register mark.
+      {
+        if(jawtimeDifference > 40) //we already know jaws are behind register mark, if the difference is greater than 40 we need to speed the jaws up
+          JawCount -= 5; //slows down the jaws by artificially lowering the jaw encoder count. The jaw PID will compensate and speed it up.
+      }
+    } //end normal run if
+    else if(jawhomeflag == -1)//for startup only; we have made a complete revolution of the jaws for homing
+    {
+      digitalWrite(JawEnable_PIN, 0); //shut off jaws
+      jawhomeflag = 2; //for startup
+      
+//      if(skipcut == 1) //flag for skipping bad patty
+//        skipcut = 2;
+    } //end homing if
+
+//    //check for misaligned patty
+//    if(!digitalRead(noGapNoCrimp_PIN)) //pin goes LOW when a patty is seen
+//    {
+//      skipcount++; //used for adding the correct amount of pulses back in after skipping one(or more) patties
+//      jawhomeflag = 1; //set these to utilize the shut off commands for the startup sequence to stop the jaws from cutting a bad patty
+//      startupFlag = 1;
+//      skipCut = 1;
+//    }
+  } //end debounce if
+ }  // end of jaw position ISR
+
