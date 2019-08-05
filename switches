@@ -1,0 +1,91 @@
+void button_results()
+{
+  if((stopBtn.wasReleased() && currently_running && StartBtnState && !StopBtnState) || errorStop) //stop button pressed OR an error triggered stop the machine
+  {
+      motorDrive(stopAll); //stop outputs
+      StartBtnState = 0;
+      StopBtnState = 1;
+      currently_running = 0; //we are not currently running for subsequent loops
+      totalpkgcount += pkgcount; //preserve
+      pkgcount = 0; //reset
+      homeflag = 0; //reset flag used for startup
+      errorStop = 0; //reset flag
+      JawCount = PaperCount = FeederCount = 0; //zero all the encoder counters to prevent surging upon restart
+      jaw_count = paper_count = feeder_count = 0; //zero all the encoder counters to help prevent surging upon startup 
+      
+//       writeLCD("STOP BUTTON PRESSED", 0);
+//       writeLCD("totalpkgs:", 0);
+//       writeLCD(totalpkgcount, 0);
+      sendString("\f"); //clear display screen
+      sendString("STOP BUTTON PRESSED\n"); //not sure if should clear screen here yet
+      sendString("Total packages: "); //user given
+      Serial.println("stop btn pressed");
+      Serial.print("Total pkgs: ");
+      sprintf(buf, "%i", totalpkgcount); //convert the number to a string
+      sendString(buf); //send out on i2c
+      Serial.println(buf);
+  }
+  //read crimp switch prior to reading start button so we know its status and know whether we can start or not
+  if(crimpSw.isReleased() && crimpStatus) //not sure if released or pressed is correct, but also only do this print once
+  {                         //either way, want machine to stop if it was running and switch was released
+    crimpStatus = 0; //dont run
+    sendString("Crimp switch released\n");//want to shut down machine here and make it think stop button was pressed
+    if(currently_running && StartBtnState && !StopBtnState)// was the switch flipped while machine was running?
+    {
+      errorStop = 1; //set this flag so next time we read buttons it stops machine
+    }
+  }
+  else if(crimpSw.isPressed())
+  {
+    crimpStatus = 1; //run
+  }
+  
+  if(startBtn.wasReleased() && !currently_running && !StartBtnState && StopBtnState && crimpStatus) //we are reading a press and release; if we have not been here prior
+  {
+//    sendString("\f");
+//    sendString("START BUTTON PRESSED\n");
+Serial.println("start btn pressed");
+    startupFlag = 1; 
+    StartBtnState = 1;
+    StopBtnState = 0;
+    currently_running = 1;
+  }
+  
+//  if(settingsBtn.wasReleased() && !StartBtnState && StopBtnState) //get new speed settings only if machine is stopped
+//  {
+    //setBtnFlag = 1;
+//    sendString("\f"); //clear the screen
+//    sendString("Setting button\npressed\n");
+//    sendString("Adjust dial to\nchange speed\n");
+//    sendString("Press button again\nto exit\n\n");
+//Serial.println("Settings btn pressed. Adjust dial to change speed.");
+//Serial.println("Press settings btn again to exit");
+//    getSettings(); //read the current speed input
+//    sendString("\f"); //clear screen
+//    sendString("\nPaper setpoint\npkg/min: "); //user given
+//Serial.print("Paper setpoint: ");
+//    sprintf(buf, "%i", setpoint); //convert the number to a string
+//    //sendString(buf); //send out on usb
+//    Serial.println(buf);
+//  }
+  
+  if(inchBtn.wasReleased() && !StartBtnState && StopBtnState) //move paper and feeder while pressed
+  {
+    //sendString("inching");
+    //analogWrite(paperPWM, 220); //write the speed during inching(hardcode for inching)
+    analogWrite(feederPWM, 845); //15 write the speed during inching(hardcode for inching)
+
+    digitalWrite(PaperEnable_PIN, 1); //enable paper vfd
+    digitalWrite(FeederEnable_PIN, 1); //enable feeder vfd
+    
+    do //wait here while button is pressed
+    {
+      inchBtn.read(); //read status of inching button     
+    }while(inchBtn.isReleased());
+
+      digitalWrite(PaperEnable_PIN, 0);
+      digitalWrite(FeederEnable_PIN, 0);
+      //analogWrite(paperPWM, 1023); //write the speed during inching(hardcode for inching)
+      analogWrite(feederPWM, 255); //15 write the speed during inching(hardcode for inching)
+  }
+}
