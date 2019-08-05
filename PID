@@ -1,0 +1,129 @@
+void feederPID(void) //calculate PID control for the feeder chain speed
+{
+  long proportional = 0, integraltemp = 0, derivative = 0, intround = 0;
+  int MaxIntegral = 200; //167?
+
+  //ensure we round the correct direction
+  if(feeder_error >= 0)
+    intround = 0.5;
+  else
+    intround = -0.5;
+
+  //reset if we cross zero
+  if(((lastfeeder_error < 0) && (feeder_error > 0)) || ((lastfeeder_error > 0) && (feeder_error < 0)))
+  {
+    feederIntegral = 0; //reset to current error
+  }
+    
+  //proportional
+  proportional = fkp * feeder_error; //proportional value * error in the encoder counts
+
+  int temp1 = feederIntegral + feeder_error; //copy of what our new integral term would be if we added in current error
+  //windup limits
+  if(temp1 > MaxIntegral) //if it is bigger than limit
+   feederIntegral = MaxIntegral; //set integral to the max
+  else if(temp1 < -MaxIntegral) //if it is smaller than -limit
+   feederIntegral = -MaxIntegral; //set integral to negative max
+  else
+    feederIntegral = temp1; //copy new integral value
+     
+  integraltemp = fki * feederIntegral; //integral scalar
+
+  //derivative
+  derivative =  fkd * ((feeder_error - lastfeeder_error)); //change in error over time
+  lastfeeder_error = feeder_error; //update
+  
+  float temp = (proportional + integraltemp + derivative) + intround; //new feeder speed. add 0.5 so feeder_speed truncates to nearest integer
+  
+  feeder_speed -= temp; //add it to the current feeder speed
+
+  //out of range check
+  if(feeder_speed > 1023)
+    feeder_speed = 1023;
+  else if(feeder_speed < 1)
+    feeder_speed = 1;
+}
+
+
+//*******************************************************************//
+void jawPID(void) //calculate PID control for the feeder chain speed
+{
+  long proportional = 0, integraltemp = 0, derivative = 0, intround = 0;
+  int MaxIntegral = 200; //167?
+
+  //ensure we round the correct direction
+  if(jaw_error >= 0)
+    intround = 0.5;
+  else
+    intround = -0.5;
+
+  //reset if we cross zero
+  if(((lastjaw_error < 0) && (jaw_error > 0)) || ((lastjaw_error > 0) && (jaw_error < 0)))
+  {
+    jawIntegral = 0; //reset to current error
+  }
+    
+  //proportional
+  proportional = jkp * jaw_error; //proportional value * error in the encoder counts
+  
+  int temp1 = jawIntegral + jaw_error; //copy of what our new integral term would be if we added in current error
+  //windup limits
+  if(temp1 > MaxIntegral) //if it is bigger than limit
+   jawIntegral = MaxIntegral; //set integral to the max
+  else if(temp1 < -MaxIntegral) //if it is smaller than -limit
+   jawIntegral = -MaxIntegral; //set integral to negative max
+  else
+    jawIntegral = temp1; //copy new integral value
+     
+  integraltemp = jki * jawIntegral; //integral scalar
+
+  //derivative
+  derivative =  jkd * ((jaw_error - lastjaw_error)); //change in error over time
+  lastjaw_error = jaw_error; //update
+  
+  float temp = (proportional + integraltemp + derivative) + intround; //new feeder speed. add 0.5 so feeder_speed truncates to nearest integer
+  
+  jaw_speed -= temp; //add it to the current jaw speed
+
+  //out of range check
+  if(jaw_speed > 1023)
+    jaw_speed = 1023;
+  else if(jaw_speed < 1)
+    jaw_speed = 1;
+}
+
+void livePIDTune(void)
+{
+    if(Serial.available() > 0)
+    {
+      char incoming = Serial.read();
+      if(incoming == 'd')
+        jkd+=0.01;
+      else if((incoming == 'c') && (jkd > 0))
+        jkd-=0.01;
+      else if(incoming == 'i')
+        jki+=0.0001;
+      else if((incoming == 'k') && (jki > 0))
+        jki-=0.0001;
+      else if(incoming == 'p')
+        jkp+=0.001;
+      else if((incoming == ';') && (jkp > 0))
+        jkp-=0.001;
+      else if(incoming == 't')
+        jawoffset+=20;
+      else if(incoming == 'y')
+        jawoffset-=20;
+
+      //settings changed, print them out
+      Serial.print(jkp, 3);
+      Serial.print(", ");
+      Serial.print(jki, 4); //print 4 decimal points precision
+      Serial.print(", ");
+      Serial.print(jkd);
+        Serial.print(", ");
+        Serial.print(jaw_speed);
+        Serial.print(", ");
+        Serial.println(jaw_error);
+        
+    }//end pid and feeder drive settings if statement
+}
